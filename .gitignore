@@ -3,7 +3,9 @@ moc
 *.moc
 *.blz
 *_restored.txt
+*_restored.bin
 bigrestored.txt
 restored.txt
 *~
 *.swp
+benchmarks/results/

@@ -1,231 +1,469 @@
 #include "../include/moc.h"
-#include "../include/reference.h"
 
 #include <stdint.h>
 #include <stdlib.h>
-
-
-#define MOC_LITERAL_BLOCK 0
-#define MOC_REFERENCE     1
-
-#define MIN_MATCH 3
-#define MAX_MATCH 32
+#include <string.h>
 
 
 /*
- * Write a 32-bit unsigned integer.
+ * ============================================================
+ * MOC V6
+ * ============================================================
+ *
+ * V6 keeps the MOC5 file format but replaces the expensive
+ * brute-force match search with a 3-byte hash index.
+ *
+ * Features:
+ *
+ *   - MOC5 compatible output
+ *   - MOC3 compatible decoder
+ *   - variable-length integers
+ *   - cost-aware references
+ *   - indexed match search
+ *
  */
-static void write_u32(
+
+
+/*
+ * Block types
+ */
+#define MOC_LITERAL_BLOCK   0
+#define MOC_REFERENCE       1
+
+
+/*
+ * Matching parameters
+ */
+#define MIN_MATCH 3
+#define MAX_MATCH 256
+
+
+/*
+ * Maximum number of candidates examined for one position.
+ *
+ * This prevents pathological inputs such as:
+ *
+ *     AAAAAAAAAAAAAAAAAAAAA...
+ *
+ * from causing enormous search times.
+ */
+#define MAX_CANDIDATES 64
+
+
+/*
+ * Hash table size.
+ *
+ * Power of two allows fast modulo using &.
+ */
+#define HASH_SIZE 65536
+
+
+/*
+ * ============================================================
+ * VARINT
+ * ============================================================
+ */
+
+static size_t varint_size(
+    uint32_t value
+) {
+    size_t size = 1;
+
+    while (value >= 128) {
+        value >>= 7;
+        size++;
+    }
+
+    return size;
+}
+
+
+static void write_varint(
     unsigned char *buffer,
     size_t *position,
     uint32_t value
 ) {
-    buffer[(*position)++] =
-        (unsigned char)(value & 0xFF);
+    while (value >= 128) {
+
+        buffer[(*position)++] =
+            (unsigned char)(
+                (value & 0x7F) | 0x80
+            );
+
+        value >>= 7;
+    }
 
     buffer[(*position)++] =
-        (unsigned char)((value >> 8) & 0xFF);
-
-    buffer[(*position)++] =
-        (unsigned char)((value >> 16) & 0xFF);
-
-    buffer[(*position)++] =
-        (unsigned char)((value >> 24) & 0xFF);
+        (unsigned char)value;
 }
 
 
-/*
- * Read a 32-bit unsigned integer.
- */
-static uint32_t read_u32(
+static int read_varint(
     const unsigned char *buffer,
-    size_t *position
+    size_t input_size,
+    size_t *position,
+    uint32_t *value
 ) {
-    uint32_t value = 0;
+    uint32_t result = 0;
 
-    value |=
-        (uint32_t)buffer[(*position)++];
+    unsigned int shift = 0;
 
-    value |=
-        (uint32_t)buffer[(*position)++] << 8;
 
-    value |=
-        (uint32_t)buffer[(*position)++] << 16;
+    while (*position < input_size) {
 
-    value |=
-        (uint32_t)buffer[(*position)++] << 24;
+        unsigned char byte =
+            buffer[(*position)++];
 
-    return value;
+
+        result |=
+            (uint32_t)(byte & 0x7F)
+            << shift;
+
+
+        if ((byte & 0x80) == 0) {
+
+            *value = result;
+
+            return 1;
+        }
+
+
+        shift += 7;
+
+
+        if (shift >= 32) {
+            return 0;
+        }
+    }
+
+
+    return 0;
 }
 
 
 /*
- * =========================================================
- * FIND MATCH - MIDDLE-OUT SEARCH
- * =========================================================
+ * ============================================================
+ * HASH
+ * ============================================================
  *
- * We still encode the file from left to right.
- *
- * Middle-Out is used only to determine the order in which
- * previous positions are searched.
- *
- * References ALWAYS point backwards.
+ * Hash exactly three bytes.
  */
-static void find_match_middle_out(
+static uint32_t hash3(
+    const unsigned char *data
+) {
+    uint32_t value =
+        ((uint32_t)data[0] << 16) |
+        ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2]);
+
+
+    /*
+     * Mix the bits.
+     */
+    value ^= value >> 11;
+
+    value *= 2654435761u;
+
+    value ^= value >> 16;
+
+
+    return value & (HASH_SIZE - 1);
+}
+
+
+/*
+ * ============================================================
+ * MATCH INDEX
+ * ============================================================
+ *
+ * Each hash bucket is a linked list of previous positions.
+ */
+
+typedef struct MatchNode {
+
+    size_t position;
+
+    struct MatchNode *next;
+
+} MatchNode;
+
+
+/*
+ * ============================================================
+ * REFERENCE COST
+ * ============================================================
+ */
+
+static size_t reference_cost(
+    size_t offset,
+    size_t length
+) {
+    return
+        1 +
+        varint_size((uint32_t)offset) +
+        varint_size((uint32_t)length);
+}
+
+
+/*
+ * ============================================================
+ * FIND BEST MATCH
+ * ============================================================
+ */
+
+static void find_match_indexed(
     const unsigned char *data,
     size_t size,
     size_t position,
+    MatchNode **table,
     size_t *best_offset,
-    size_t *best_length
+    size_t *best_length,
+    int *best_score
 ) {
     *best_offset = 0;
+
     *best_length = 0;
 
+    *best_score = -1000000;
 
-    if (position < MIN_MATCH) {
+
+    /*
+     * Need at least three bytes for the index key.
+     */
+    if (
+        position + MIN_MATCH >
+        size
+    ) {
         return;
     }
 
 
-    size_t maximum_length =
-        size - position;
+    /*
+     * Look up current three-byte sequence.
+     */
+    uint32_t hash =
+        hash3(data + position);
 
 
-    if (maximum_length > MAX_MATCH) {
-        maximum_length = MAX_MATCH;
+    MatchNode *node =
+        table[hash];
+
+
+    size_t candidates = 0;
+
+
+    /*
+     * Examine candidates from newest to oldest.
+     */
+    while (
+        node != NULL &&
+        candidates < MAX_CANDIDATES
+    ) {
+
+        size_t previous =
+            node->position;
+
+
+        /*
+         * Safety.
+         */
+        if (previous >= position) {
+            node = node->next;
+            continue;
+        }
+
+
+        size_t offset =
+            position - previous;
+
+
+        /*
+         * Find match length.
+         */
+        size_t maximum_length =
+            size - position;
+
+
+        if (
+            maximum_length >
+            MAX_MATCH
+        ) {
+            maximum_length =
+                MAX_MATCH;
+        }
+
+
+        size_t length = 0;
+
+
+        /*
+         * Overlapping matches are supported.
+         */
+        while (
+            length < maximum_length
+        ) {
+
+            size_t source =
+                previous +
+                (length % offset);
+
+
+            if (
+                source >= position
+            ) {
+                break;
+            }
+
+
+            if (
+                data[source] !=
+                data[position + length]
+            ) {
+                break;
+            }
+
+
+            length++;
+        }
+
+
+        if (length >= MIN_MATCH) {
+
+            size_t cost =
+                reference_cost(
+                    offset,
+                    length
+                );
+
+
+            int score =
+                (int)length -
+                (int)cost;
+
+
+            /*
+             * Prefer maximum savings.
+             */
+            if (
+                score > *best_score ||
+                (
+                    score == *best_score &&
+                    length > *best_length
+                ) ||
+                (
+                    score == *best_score &&
+                    length == *best_length &&
+                    offset < *best_offset
+                )
+            ) {
+
+                *best_score =
+                    score;
+
+                *best_length =
+                    length;
+
+                *best_offset =
+                    offset;
+            }
+        }
+
+
+        candidates++;
+
+        node = node->next;
+    }
+}
+
+
+/*
+ * ============================================================
+ * ADD POSITION TO INDEX
+ * ============================================================
+ */
+
+static int index_position(
+    const unsigned char *data,
+    size_t size,
+    size_t position,
+    MatchNode **table
+) {
+    if (
+        position + MIN_MATCH >
+        size
+    ) {
+        return 1;
     }
 
 
-    /*
-     * All data before the current position is our
-     * search history.
-     */
-    size_t history = position;
-
-    size_t middle = history / 2;
+    uint32_t hash =
+        hash3(data + position);
 
 
-    /*
-     * Search from the middle outward.
-     */
+    MatchNode *node =
+        malloc(sizeof(MatchNode));
+
+
+    if (!node) {
+        return 0;
+    }
+
+
+    node->position =
+        position;
+
+
+    node->next =
+        table[hash];
+
+
+    table[hash] =
+        node;
+
+
+    return 1;
+}
+
+
+/*
+ * ============================================================
+ * FREE INDEX
+ * ============================================================
+ */
+
+static void free_index(
+    MatchNode **table
+) {
     for (
-        size_t distance = 0;
-        distance < history;
-        distance++
+        size_t i = 0;
+        i < HASH_SIZE;
+        i++
     ) {
 
-        size_t candidates[2];
-
-        size_t candidate_count = 0;
-
-
-        /*
-         * Left side.
-         */
-        if (middle >= distance) {
-
-            candidates[candidate_count++] =
-                middle - distance;
-        }
+        MatchNode *node =
+            table[i];
 
 
-        /*
-         * Right side.
-         */
-        if (
-            distance != 0 &&
-            middle + distance < history
-        ) {
+        while (node) {
 
-            candidates[candidate_count++] =
-                middle + distance;
-        }
+            MatchNode *next =
+                node->next;
 
 
-        for (
-            size_t c = 0;
-            c < candidate_count;
-            c++
-        ) {
+            free(node);
 
-            size_t previous =
-                candidates[c];
-
-
-            /*
-             * Candidate must be before current
-             * position.
-             */
-            if (previous >= position) {
-                continue;
-            }
-
-
-            size_t distance_back =
-                position - previous;
-
-
-            size_t length = 0;
-
-
-            /*
-             * Compare bytes.
-             *
-             * Overlapping matches are allowed.
-             */
-            while (
-                length < maximum_length
-            ) {
-
-                size_t source =
-                    previous +
-                    (length % distance_back);
-
-
-                size_t target =
-                    position + length;
-
-
-                if (source >= position) {
-                    break;
-                }
-
-
-                if (
-                    data[source] !=
-                    data[target]
-                ) {
-                    break;
-                }
-
-
-                length++;
-            }
-
-
-            /*
-             * Keep the longest match.
-             */
-            if (
-                length >= MIN_MATCH &&
-                length > *best_length
-            ) {
-
-                *best_length = length;
-
-                *best_offset =
-                    distance_back;
-            }
+            node = next;
         }
     }
 }
 
 
 /*
- * =========================================================
- * MOC V3 COMPRESSOR
- * =========================================================
+ * ============================================================
+ * MOC5 COMPRESSOR
+ * ============================================================
  */
+
 int moc_compress(
     const unsigned char *input,
     size_t input_size,
@@ -233,12 +471,10 @@ int moc_compress(
     size_t *output_size
 ) {
     /*
-     * Allocate generously for now.
-     *
-     * We will optimize the allocation later.
+     * Allocate output buffer.
      */
     size_t capacity =
-        input_size * 10 + 16;
+        input_size * 2 + 1024;
 
 
     unsigned char *buffer =
@@ -250,79 +486,148 @@ int moc_compress(
     }
 
 
+    /*
+     * Allocate hash table.
+     */
+    MatchNode **table =
+        calloc(
+            HASH_SIZE,
+            sizeof(MatchNode *)
+        );
+
+
+    if (!table) {
+
+        free(buffer);
+
+        return 0;
+    }
+
+
     size_t out = 0;
 
 
     /*
-     * Header:
-     *
-     * 4 bytes magic
-     * 4 bytes original size
+     * --------------------------------------------------------
+     * MOC5 HEADER
+     * --------------------------------------------------------
      */
     buffer[out++] = 'M';
     buffer[out++] = 'O';
     buffer[out++] = 'C';
-    buffer[out++] = '3';
+    buffer[out++] = '5';
 
 
-    write_u32(
-        buffer,
-        &out,
-        (uint32_t)input_size
-    );
+    uint32_t original_size =
+        (uint32_t)input_size;
+
+
+    buffer[out++] =
+        (unsigned char)(
+            original_size & 0xFF
+        );
+
+
+    buffer[out++] =
+        (unsigned char)(
+            (original_size >> 8) & 0xFF
+        );
+
+
+    buffer[out++] =
+        (unsigned char)(
+            (original_size >> 16) & 0xFF
+        );
+
+
+    buffer[out++] =
+        (unsigned char)(
+            (original_size >> 24) & 0xFF
+        );
 
 
     size_t position = 0;
 
 
-    while (position < input_size) {
+    while (
+        position < input_size
+    ) {
 
         size_t offset = 0;
+
         size_t length = 0;
+
+        int score = -1000000;
 
 
         /*
-         * Look for a Middle-Out match.
+         * Find best indexed match.
          */
-        find_match_middle_out(
+        find_match_indexed(
             input,
             input_size,
             position,
+            table,
             &offset,
-            &length
+            &length,
+            &score
         );
 
 
         /*
-         * A reference costs:
-         *
-         * 1 byte token
-         * 4 bytes offset
-         * 4 bytes length
-         *
-         * Total = 9 bytes.
-         *
-         * Therefore a match of 9 bytes or less
-         * is not worthwhile.
+         * Use reference if it saves space.
          */
-        if (length > 9) {
+        if (
+            score > 0 &&
+            length >= MIN_MATCH
+        ) {
 
             buffer[out++] =
                 MOC_REFERENCE;
 
 
-            write_u32(
+            write_varint(
                 buffer,
                 &out,
                 (uint32_t)offset
             );
 
 
-            write_u32(
+            write_varint(
                 buffer,
                 &out,
                 (uint32_t)length
             );
+
+
+            /*
+             * Add every consumed position
+             * to the index.
+             */
+            for (
+                size_t i = 0;
+                i < length;
+                i++
+            ) {
+
+                if (
+                    !index_position(
+                        input,
+                        input_size,
+                        position + i,
+                        table
+                    )
+                ) {
+
+                    free_index(table);
+
+                    free(table);
+
+                    free(buffer);
+
+                    return 0;
+                }
+            }
 
 
             position += length;
@@ -332,53 +637,69 @@ int moc_compress(
 
 
         /*
-         * =================================================
+         * ----------------------------------------------------
          * LITERAL BLOCK
-         * =================================================
+         * ----------------------------------------------------
          *
-         * Instead of storing:
-         *
-         *   TOKEN A
-         *   TOKEN B
-         *   TOKEN C
-         *
-         * we store:
-         *
-         *   LITERAL_BLOCK
-         *   LENGTH
-         *   A B C
-         *
-         * This is particularly important for random data.
+         * Gather bytes until a profitable reference
+         * appears.
          */
         size_t literal_start =
             position;
 
 
-        size_t literal_length =
-            0;
+        size_t literal_length = 0;
 
 
-        while (position < input_size) {
+        while (
+            position < input_size
+        ) {
 
             size_t test_offset = 0;
+
             size_t test_length = 0;
 
+            int test_score = -1000000;
 
-            find_match_middle_out(
+
+            find_match_indexed(
                 input,
                 input_size,
                 position,
+                table,
                 &test_offset,
-                &test_length
+                &test_length,
+                &test_score
             );
 
 
-            /*
-             * Stop the literal block when a useful
-             * reference is found.
-             */
-            if (test_length > 9) {
+            if (
+                test_score > 0 &&
+                test_length >= MIN_MATCH
+            ) {
                 break;
+            }
+
+
+            /*
+             * Add this literal position to index.
+             */
+            if (
+                !index_position(
+                    input,
+                    input_size,
+                    position,
+                    table
+                )
+            ) {
+
+                free_index(table);
+
+                free(table);
+
+                free(buffer);
+
+                return 0;
             }
 
 
@@ -389,49 +710,53 @@ int moc_compress(
 
 
         /*
-         * Literal block format:
-         *
-         * 1 byte  token
-         * 4 bytes length
-         * N bytes data
+         * Literal token.
          */
         buffer[out++] =
             MOC_LITERAL_BLOCK;
 
 
-        write_u32(
+        write_varint(
             buffer,
             &out,
             (uint32_t)literal_length
         );
 
 
-        for (
-            size_t i = 0;
-            i < literal_length;
-            i++
-        ) {
+        memcpy(
+            buffer + out,
+            input + literal_start,
+            literal_length
+        );
 
-            buffer[out++] =
-                input[
-                    literal_start + i
-                ];
-        }
+
+        out += literal_length;
     }
 
 
-    *output = buffer;
+    free_index(table);
 
-    *output_size = out;
+    free(table);
+
+
+    *output =
+        buffer;
+
+
+    *output_size =
+        out;
+
 
     return 1;
 }
 
 
 /*
- * =========================================================
- * MOC V3 DECOMPRESSOR
- * =========================================================
+ * ============================================================
+ * DECOMPRESSOR
+ * ============================================================
+ *
+ * Supports both MOC3 and MOC5.
  */
 int moc_decompress(
     const unsigned char *input,
@@ -439,25 +764,31 @@ int moc_decompress(
     unsigned char **output,
     size_t *output_size
 ) {
-    /*
-     * Minimum valid file:
-     *
-     * 4 bytes magic
-     * 4 bytes original size
-     */
     if (input_size < 8) {
         return 0;
     }
 
 
     /*
-     * Check magic.
+     * Detect format.
      */
+    int is_moc3 =
+        input[0] == 'M' &&
+        input[1] == 'O' &&
+        input[2] == 'C' &&
+        input[3] == '3';
+
+
+    int is_moc5 =
+        input[0] == 'M' &&
+        input[1] == 'O' &&
+        input[2] == 'C' &&
+        input[3] == '5';
+
+
     if (
-        input[0] != 'M' ||
-        input[1] != 'O' ||
-        input[2] != 'C' ||
-        input[3] != '3'
+        !is_moc3 &&
+        !is_moc5
     ) {
         return 0;
     }
@@ -466,11 +797,20 @@ int moc_decompress(
     size_t position = 4;
 
 
+    /*
+     * Original size.
+     */
     uint32_t original_size =
-        read_u32(
-            input,
-            &position
-        );
+        (uint32_t)input[position++];
+
+    original_size |=
+        (uint32_t)input[position++] << 8;
+
+    original_size |=
+        (uint32_t)input[position++] << 16;
+
+    original_size |=
+        (uint32_t)input[position++] << 24;
 
 
     unsigned char *buffer =
@@ -498,122 +838,182 @@ int moc_decompress(
 
 
         /*
-         * =================================================
-         * LITERAL BLOCK
-         * =================================================
+         * ----------------------------------------------------
+         * LITERAL
+         * ----------------------------------------------------
          */
         if (
             type ==
             MOC_LITERAL_BLOCK
         ) {
 
-            /*
-             * Need 4 bytes for length.
-             */
-            if (
-                position + 4 >
-                input_size
-            ) {
+            uint32_t length = 0;
 
-                free(buffer);
-                return 0;
+
+            if (is_moc5) {
+
+                if (
+                    !read_varint(
+                        input,
+                        input_size,
+                        &position,
+                        &length
+                    )
+                ) {
+
+                    free(buffer);
+
+                    return 0;
+                }
+
+            } else {
+
+                if (
+                    position + 4 >
+                    input_size
+                ) {
+
+                    free(buffer);
+
+                    return 0;
+                }
+
+
+                length =
+                    (uint32_t)input[position++];
+
+                length |=
+                    (uint32_t)input[position++] << 8;
+
+                length |=
+                    (uint32_t)input[position++] << 16;
+
+                length |=
+                    (uint32_t)input[position++] << 24;
             }
 
 
-            uint32_t length =
-                read_u32(
-                    input,
-                    &position
-                );
-
-
-            /*
-             * Validate the block.
-             */
             if (
                 position + length >
-                input_size
-            ) {
-
-                free(buffer);
-                return 0;
-            }
-
-
-            if (
+                input_size ||
                 out + length >
                 original_size
             ) {
 
                 free(buffer);
+
                 return 0;
             }
 
 
-            /*
-             * Copy literal bytes.
-             */
-            for (
-                uint32_t i = 0;
-                i < length;
-                i++
-            ) {
+            memcpy(
+                buffer + out,
+                input + position,
+                length
+            );
 
-                buffer[out++] =
-                    input[position++];
-            }
+
+            position += length;
+
+            out += length;
         }
 
 
         /*
-         * =================================================
+         * ----------------------------------------------------
          * REFERENCE
-         * =================================================
+         * ----------------------------------------------------
          */
         else if (
             type ==
             MOC_REFERENCE
         ) {
 
-            /*
-             * Need:
-             *
-             * 4 bytes offset
-             * 4 bytes length
-             */
-            if (
-                position + 8 >
-                input_size
-            ) {
+            uint32_t offset = 0;
 
-                free(buffer);
-                return 0;
+            uint32_t length = 0;
+
+
+            if (is_moc5) {
+
+                if (
+                    !read_varint(
+                        input,
+                        input_size,
+                        &position,
+                        &offset
+                    )
+                ) {
+
+                    free(buffer);
+
+                    return 0;
+                }
+
+
+                if (
+                    !read_varint(
+                        input,
+                        input_size,
+                        &position,
+                        &length
+                    )
+                ) {
+
+                    free(buffer);
+
+                    return 0;
+                }
+
+            } else {
+
+                if (
+                    position + 8 >
+                    input_size
+                ) {
+
+                    free(buffer);
+
+                    return 0;
+                }
+
+
+                offset =
+                    (uint32_t)input[position++];
+
+                offset |=
+                    (uint32_t)input[position++] << 8;
+
+                offset |=
+                    (uint32_t)input[position++] << 16;
+
+                offset |=
+                    (uint32_t)input[position++] << 24;
+
+
+                length =
+                    (uint32_t)input[position++];
+
+                length |=
+                    (uint32_t)input[position++] << 8;
+
+                length |=
+                    (uint32_t)input[position++] << 16;
+
+                length |=
+                    (uint32_t)input[position++] << 24;
             }
 
 
-            uint32_t offset =
-                read_u32(
-                    input,
-                    &position
-                );
-
-
-            uint32_t length =
-                read_u32(
-                    input,
-                    &position
-                );
-
-
-            /*
-             * Reference must point backwards.
-             */
             if (
                 offset == 0 ||
-                offset > out
+                offset > out ||
+                out + length >
+                original_size
             ) {
 
                 free(buffer);
+
                 return 0;
             }
 
@@ -623,10 +1023,7 @@ int moc_decompress(
 
 
             /*
-             * Copy byte-by-byte.
-             *
-             * This supports overlapping
-             * LZ-style references.
+             * Overlapping copy.
              */
             for (
                 uint32_t i = 0;
@@ -634,27 +1031,12 @@ int moc_decompress(
                 i++
             ) {
 
-                if (
-                    out >=
-                    original_size
-                ) {
-
-                    free(buffer);
-                    return 0;
-                }
-
-
                 buffer[out++] =
-                    buffer[
-                        source + i
-                    ];
+                    buffer[source + i];
             }
         }
 
 
-        /*
-         * Unknown token.
-         */
         else {
 
             free(buffer);
@@ -665,8 +1047,7 @@ int moc_decompress(
 
 
     /*
-     * The reconstructed file must have exactly
-     * the size stored in the header.
+     * Integrity check.
      */
     if (
         out != original_size
@@ -678,9 +1059,13 @@ int moc_decompress(
     }
 
 
-    *output = buffer;
+    *output =
+        buffer;
 
-    *output_size = out;
+
+    *output_size =
+        out;
+
 
     return 1;
 }
