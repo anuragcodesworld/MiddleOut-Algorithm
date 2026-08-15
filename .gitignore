@@ -1,0 +1,9 @@
+moc
+*.o
+*.moc
+*.blz
+*_restored.txt
+bigrestored.txt
+restored.txt
+*~
+*.swp
