@@ -1,11 +1,25 @@
+# Build artifacts
 moc
+moc_v*
 *.o
+
+# Compression outputs
 *.moc
+
+# Restored/test files
+*_restored.*
+*.bin
+
+# Local benchmark/generated data
+benchmarks/data/stress/*.bin
+
+# Editor / OS files
+*~
+.vscode/
+.idea/
+
+# Generated compression / restoration artifacts
 *.blz
-*_restored.txt
-*_restored.bin
 bigrestored.txt
 restored.txt
-*~
-*.swp
 benchmarks/results/
